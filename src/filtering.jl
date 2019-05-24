@@ -89,25 +89,42 @@ end
 function update!(pf::AuxiliaryParticleFilter,u, y, t = index(pf))
     s = state(pf)
     N = num_particles(s)
+
     propagate_particles!(pf.pf, u, t, nothing)# Propagate without noise
     λ  = s.we
     λ .= 0
-    measurement_equation!(pf.pf, y, t, measurement_density(pf), λ)
+    measurement_equation!(pf.pf, y, t, λ)
     s.w .+= λ
-    expnormalize!(s.bins,s.w)
-    if effective_particles(s.bins) < resample_threshold(pf)*N
-        j = resample(ResampleSystematicExp, s.w , s.j, s.bins)
-        fill!(s.w, -log(N))
-        s.w .-= λ[j]
-        s.x .= s.x[j] # TODO: these lines allocate
-    else
-        s.j .= 1:N
-        s.w .-= λ
-    end
+    expnormalize!(s.w) # w used as buffer
+    j = resample(ResampleSystematic, s.w , s.j, s.bins)
+    reset_weights!(s)
+    permute_with_buffer!(s.x, s.xprev, j)
     add_noise!(pf.pf)
-    # s.w .= s.w[j] # TODO: these lines allocate
-    copyto!(s.xprev, s.x)
+
     s.t[] += 1
+    copyto!(s.xprev, s.x)
+
+    # Correct step
+    measurement_equation!(pf.pf, y, t)
+    loklik = logsumexp!(s)
+end
+
+function update!(pf::AuxiliaryParticleFilter{<:AdvancedParticleFilter},u, y, t = index(pf)) # we need to special case this as it's hard to make the above more general without sacrifying performance
+    s = state(pf)
+    N = num_particles(s)
+
+    propagate_particles!(pf.pf, u, t, nothing)# Propagate without noise
+    λ  = s.we
+    λ .= 0
+    measurement_equation!(pf.pf, y, t, λ)
+    s.w .+= λ
+    expnormalize!(s.w) # w used as buffer
+    j = resample(ResampleSystematic, s.w , s.j, s.bins)
+    reset_weights!(s)
+    propagate_particles!(pf.pf, u, j, t)# Propagate with noise and permutation
+
+    s.t[] += 1
+    copyto!(s.xprev, s.x)
 
     # Correct step
     measurement_equation!(pf.pf, y, t)
@@ -166,7 +183,7 @@ function forward_trajectory(pf, u::AbstractVector, y::AbstractVector)
     ll = 0.0
     @inbounds for t = 1:T
         ll += pf(u[t], y[t], t)
-        x[:,t] .= particles(pf)
+        x[:,t] .= state(pf).xprev # TODO: verify this
         w[:,t] .= weights(pf)
         we[:,t] .= expweights(pf)
     end
@@ -180,7 +197,10 @@ x,ll = mean_trajectory(pf, u::Vector{Vector}, y::Vector{Vector})
 
 This Function resets the particle filter to the initial state distribution upon start
 """
-function mean_trajectory(pf, u::Vector, y::Vector)
+mean_trajectory(pf, u::Vector, y::Vector) = reduce_trajectory(pf, u::Vector, y::Vector, weigthed_mean)
+mode_trajectory(pf, u::Vector, y::Vector) = reduce_trajectory(pf, u::Vector, y::Vector, mode)
+
+function reduce_trajectory(pf, u::Vector, y::Vector, f::F) where F
     reset!(pf)
     T = length(y)
     N = num_particles(pf)
@@ -188,10 +208,14 @@ function mean_trajectory(pf, u::Vector, y::Vector)
     ll = 0.0
     for t = 1:T
         ll += pf(u[t], y[t], t)
-        x[t] = weigthed_mean(pf)
+        x[t] = f(pf)
     end
     x,ll
 end
+
+StatsBase.mode(pf::AbstractParticleFilter) = particles(pf)[findmax(expparticles(pf))[2]]
+
+mode_trajectory(x::AbstractMatrix, we::AbstractMatrix) =  reduce(hcat,vec(x[findmax(we, dims=1)[2]]))'
 
 function mean_trajectory(x::AbstractMatrix, we::AbstractMatrix)
     copy(reduce(hcat,vec(sum(x.*we,dims=1)))')
@@ -230,8 +254,8 @@ function weigthed_mean(x,we::AbstractVector)
     return xh
 end
 function weigthed_mean(x,we::AbstractMatrix)
-    @assert sum(we) ≈ 1
     N,T = size(x)
+    @assert sum(we) ≈ T
     xh = zeros(eltype(x), T)
     for t = 1:T
         @inbounds @simd for i = 1:N
