@@ -1,9 +1,3 @@
-function reset!(kf::AbstractKalmanFilter)
-    kf.x .= Vector(kf.d0.μ)
-    kf.R .= copy(Matrix(kf.d0.Σ))
-    kf.t[] = 1
-end
-
 """
     Reset the filter to initial state and covariance/distribution
 """
@@ -74,7 +68,7 @@ Update state/covariance/weights based on measurement `y`,  returns loglikelihood
 """
 function correct!(pf, y, t = index(pf))
     measurement_equation!(pf, y, t)
-    loklik = logsumexp!(pf.state)
+    loklik = logsumexp!(state(pf))
 end
 
 """
@@ -138,12 +132,17 @@ end
 (pf::AdvancedParticleFilter)(u, y, t = index(pf)) =  update!(pf, u, y, t)
 
 
-
 """
-x,xt,R,Rt,ll = forward_trajectory(kf, u::Vector{Vector}, y::Vector{Vector})
-x,w,ll       = forward_trajectory(pf, u::Vector{Vector}, y::Vector{Vector})
+    forward_trajectory(kf::AbstractKalmanFilter, u::Vector, y::Vector)
 
-This Function resets the filter to the initial state distribution upon start
+Run a Kalman filter forward
+
+#Returns:
+- `x`: predictions
+- `xt`: filtered estimates
+- `R`: predicted covariance matrices
+- `Rt`: filter covariances
+- `ll`: loglik
 """
 function forward_trajectory(kf::AbstractKalmanFilter, u::Vector, y::Vector)
     reset!(kf)
@@ -180,10 +179,13 @@ function forward_trajectory(pf, u::AbstractVector, y::AbstractVector)
     x = Array{particletype(pf)}(undef,N,T)
     w = Array{Float64}(undef,N,T)
     we = Array{Float64}(undef,N,T)
-    ll = 0.0
-    @inbounds for t = 1:T
-        ll += pf(u[t], y[t], t)
-        x[:,t] .= state(pf).xprev # TODO: verify this
+    ll = correct!(pf, y[1], 1)
+    x[:,1] .= particles(pf)
+    w[:,1] .= weights(pf)
+    we[:,1] .= expweights(pf)
+    @inbounds for t = 2:T
+        ll += pf(u[t-1], y[t], t-1) # predicts with t-1 and corrects with t
+        x[:,t] .= particles(pf)
         w[:,t] .= weights(pf)
         we[:,t] .= expweights(pf)
     end
